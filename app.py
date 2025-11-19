@@ -20,6 +20,7 @@ def get_data():
     JOIN Posto_Graduacao pg ON m.id_posto_graduacao_fk = pg.id_posto_graduacao
     JOIN Quadro q ON m.id_quadro_fk = q.id_quadro
     JOIN Unidade u ON m.id_unidade_atual_fk = u.id_unidade
+    ORDER BY pg.id_posto_graduacao
     """
     df = conn.query(query, ttl=600) # Cache data for 10 minutes
     return df
