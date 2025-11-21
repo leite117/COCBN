@@ -1,33 +1,72 @@
-
 import streamlit as st
 import pandas as pd
 import mysql.connector
 import plotly.express as px
 
 # Function to fetch data using st.connection
-@st.cache_data
+@st.cache_data(ttl=600)
 def get_data():
     conn = st.connection('mysql', type='sql')
+
+    # Fetch all necessary data in fewer queries
+    df_unidade = conn.query("SELECT id_unidade, sigla, id_unidade_fk FROM Unidade", ttl=600)
+    
     query = """
-    SELECT
-        m.nome,
+    SELECT 
+        m.id_militar, 
+        m.nome, 
+        m.id_posto_graduacao_fk, 
+        m.id_quadro_fk, 
+        m.id_unidade_atual_fk,
+        pg.id_posto_graduacao,
         pg.sigla AS posto_graduacao_sigla,
         pg.descricao AS posto_graduacao,
+        q.id_quadro,
         q.sigla AS quadro_sigla,
-        q.descricao AS quadro,
-        u.sigla AS unidade,
-        GROUP_CONCAT(e.tipo_especialidade SEPARATOR ', ') AS especialidades
+        q.descricao AS quadro
     FROM Militar m
     JOIN Posto_Graduacao pg ON m.id_posto_graduacao_fk = pg.id_posto_graduacao
     JOIN Quadro q ON m.id_quadro_fk = q.id_quadro
-    JOIN Unidade u ON m.id_unidade_atual_fk = u.id_unidade
-    LEFT JOIN militar_especialidade me ON m.id_militar = me.id_militar_fk
-    LEFT JOIN Especialidade e ON me.id_especialidade_fk = e.id_especialidade
-    GROUP BY m.id_militar, m.nome, pg.sigla, pg.descricao, q.sigla, q.descricao, u.sigla
-    ORDER BY pg.id_posto_graduacao
     """
-    df = conn.query(query, ttl=600) # Cache data for 10 minutes
+    df = conn.query(query, ttl=600)
+
+    df_especialidades_query = """
+    SELECT 
+        me.id_militar_fk,
+        GROUP_CONCAT(e.tipo_especialidade SEPARATOR ', ') AS especialidades
+    FROM militar_especialidade me
+    JOIN Especialidade e ON me.id_especialidade_fk = e.id_especialidade
+    GROUP BY me.id_militar_fk
+    """
+    df_especialidades = conn.query(df_especialidades_query, ttl=600)
+
+    # Optimized path building
+    unit_map = df_unidade.set_index('id_unidade').to_dict('index')
+    
+    @st.cache_data
+    def get_unit_path_optimized(unit_id, unit_map):
+        path = []
+        current_id = unit_id
+        while pd.notna(current_id):
+            unit_info = unit_map.get(current_id)
+            if unit_info:
+                path.append(unit_info['sigla'])
+                current_id = unit_info.get('id_unidade_fk')
+            else:
+                break
+        return ' / '.join(reversed(path))
+
+    df['unidade'] = df['id_unidade_atual_fk'].apply(lambda x: get_unit_path_optimized(x, unit_map))
+
+    # Merge especialidades
+    df = pd.merge(df, df_especialidades, left_on='id_militar', right_on='id_militar_fk', how='left')
     df['especialidades'] = df['especialidades'].fillna('Nenhuma')
+
+    # Clean up columns
+    df = df[['nome', 'posto_graduacao_sigla', 'posto_graduacao', 'id_posto_graduacao', 'quadro_sigla', 'quadro', 'unidade', 'id_unidade_atual_fk', 'especialidades']]
+    df = df.rename(columns={'id_unidade_atual_fk': 'id_unidade'})
+    df = df.sort_values(by='id_posto_graduacao').reset_index(drop=True)
+
     return df
 
 # Main app
@@ -40,12 +79,24 @@ def main():
     # Sidebar
     st.sidebar.header("Filtros")
     
-    # Obtenha valores únicos e ordene-os para melhor usabilidade
-    unidades_options = sorted(df['unidade'].unique())
-    postos_options = sorted(df['posto_graduacao_sigla'].unique())
+    # Get unique unidade paths and their corresponding IDs, then sort by ID
+    unidades_sorted_df = df[['unidade', 'id_unidade']].drop_duplicates()
+    unidades_cocbn = unidades_sorted_df[unidades_sorted_df['unidade'].str.startswith('COCB-N', na=False)]
+    unidades_cocbn_sorted = unidades_cocbn.sort_values(by='id_unidade')
+    unidades_options = unidades_cocbn_sorted['unidade'].tolist()
+
+    # Get unique posto_graduacao_sigla and their corresponding IDs, then sort by ID
+    postos_sorted_df = df[['posto_graduacao_sigla', 'id_posto_graduacao']].drop_duplicates().sort_values(by='id_posto_graduacao')
+    postos_options = postos_sorted_df['posto_graduacao_sigla'].tolist()
+    
     quadros_options = sorted(df['quadro_sigla'].unique())
 
-    unidades = st.sidebar.multiselect("Selecione a Unidade", options=unidades_options, default=unidades_options)
+    unidades = st.sidebar.multiselect(
+        "Selecione a Unidade", 
+        options=unidades_options, 
+        default=unidades_options,
+        format_func=lambda path: path.split(' / ')[-1]
+    )
     postos = st.sidebar.multiselect("Selecione o Posto/Graduação", options=postos_options, default=postos_options)
     quadros = st.sidebar.multiselect("Selecione o Quadro", options=quadros_options, default=quadros_options)
 
@@ -86,11 +137,14 @@ def main():
 
     # Main page
     st.header("Distribuição de Militares por Unidade")
-    unidade_counts = df_selection['unidade'].value_counts().reset_index()
+    # Create a temporary column for display
+    df_selection['unidade_sigla_display'] = df_selection['unidade'].apply(lambda x: x.split(' / ')[-1])
+
+    unidade_counts = df_selection['unidade_sigla_display'].value_counts().reset_index()
     unidade_counts.columns = ['Unidade', 'Quantidade']
     fig3 = px.bar(
         unidade_counts, 
-        x='Unidade', 
+        x='Unidade', # Use the new display column
         y='Quantidade', 
         title="Militares por Unidade",
         template="plotly_white"
@@ -122,7 +176,7 @@ def main():
     st.plotly_chart(fig1)
     
     st.header("Dados dos Militares")
-    st.dataframe(df_selection)
+    st.dataframe(df_selection.sort_values(by='id_posto_graduacao').drop('id_posto_graduacao', axis=1))
 
 if __name__ == "__main__":
     main()
